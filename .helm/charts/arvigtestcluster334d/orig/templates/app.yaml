@@ -1,0 +1,5 @@
+{{- include "lara-lib.ingress" . }}
+---
+{{- include "lara-lib.service" . }}
+---
+{{- include "lara-lib.deployment" . }}

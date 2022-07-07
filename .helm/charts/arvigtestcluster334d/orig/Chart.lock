@@ -1,0 +1,6 @@
+dependencies:
+- name: laravel-library
+  repository: file://../../libraries/laravel-library
+  version: 0.1.0
+digest: sha256:4fc779be7fbadc6975250e4a249a94bd45585c0aad2f2fde1fbe4e9a1567ad75
+generated: "2022-03-10T16:32:57.460457-07:00"

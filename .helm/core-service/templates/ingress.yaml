@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: arvig-apps-ingress
+  namespace: gapi-plus
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      rewrite ^(/pre-sales)$ $1/ redirect;  # This adds /pre-sales-api into relative links in the HTML body. 
+      rewrite ^(/pre-sales-api)$ $1/ redirect;  # This adds /pre-sales-api into relative links in the HTML body. 
+      rewrite ^(/serviceability-api)$ $1/ redirect;  # This adds /serviceability-api into relative links in the HTML body. 
+spec:
+  rules:
+    - host: arvig-apps.local
+      http:
+        paths:
+          {{- range .Values.ingress.hosts.paths }}
+            - path: {{ .path }}
+              pathType: {{ .pathType }}
+              backend:
+                service:
+                  name: {{ .service.name }}
+                  port:
+                    number: {{ .service.port }}
+          {{- end }}

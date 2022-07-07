@@ -1,0 +1,276 @@
+# Deploy to Azure Kubernetes Service
+# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+# YOU WILL NEED TO REPLACE VARIABLES HERE RELATED TO THE ARVIG CLUSTER ON AZURE
+  # App
+  workingDirectory: '/var/www/laravel'
+  phpVersion: 8.1
+  # Pipeline
+  environment: 'Arvigtestintegration.arvig-test-clusterb506'
+  # kub
+  kubServiceEndpoint: 'arvig-test-cluster-arvig-test-clusterb506-admin'
+  namespace: 'arvig-test-clusterb506'
+  deployment: arvigtestcluster334d
+  # Prod and Stage services
+  service: arvigtestcluster334d
+  service-stage: arvigtestcluster334d-stage
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '60b1e7bb-9b8d-4857-ba64-cfad1968db5f'
+  imageRepository: 'arvigtestcluster334d'
+  containerRegistry: 'arvigtestregistry.azurecr.io'
+  dockerfilePath: '**/.docker/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'arvigtestregistrya4d4-auth'
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+stages:
+- stage: GatherInfo
+  displayName: Gathering Info
+  jobs:
+  - job: GatheringInfoJob
+    displayName: "Gathering Info on existing"
+    steps:
+    - task: KubectlInstaller@0
+      displayName: Installing kubectl
+      inputs:
+        kubectlVersion: 'latest'            
+    # Determine which slot (blue/green) is currently being used so we can deploy to the opposite one
+    - task: Kubernetes@1
+      displayName: Getting existing blue/green config on the Service
+      name: serviceSlotInformation
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: $(kubServiceEndpoint)
+        namespace: $(namespace)
+        command: 'get'
+        arguments: "services -o jsonpath='{.items[0].spec.selector.slot}'"
+        #arguments: "services --selector=app=$(deployment) -o spec.selector.slot"
+        secretType: 'dockerRegistry'
+        # containerRegistryType: 'Azure Container Registry'
+        outputFormat: none
+    # Set a variable representing old/new colors that Azure Pipelines can use
+    - bash: |
+        echo "kubectl result: $SERVICESLOTINFORMATION_KUBECTLOUTPUT"
+        if grep -q "blue" <<< "$SERVICESLOTINFORMATION_KUBECTLOUTPUT"; then
+          new_color="green"
+          existing_color="blue"
+        else
+          new_color="blue"
+          existing_color="green"
+        fi
+        echo "Existing Service is $existing_color | New Service is $new_color"
+        echo "##vso[task.setvariable variable=newSlot;isOutput=true]$new_color"
+        echo "##vso[task.setvariable variable=oldSlot;isOutput=true]$existing_color"
+      name: PassOutputColors
+      displayName: Setting Service Slots   
+    # ARTIFACTS FOR LATER USE IN THE PIPELINE      
+    - upload: manifests
+      artifact: manifests
+    - upload: tests
+      artifact: tests
+    - upload: .helm
+      artifact: .helm
+# BUILD THE NEW IMAGE WHEN TRIGGERED      
+- stage: Build
+  displayName: Build stage
+  dependsOn: GatherInfo
+  condition: succeeded()
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: |
+        sudo update-alternatives --set php /usr/bin/php$(phpVersion)
+        sudo update-alternatives --set phar /usr/bin/phar$(phpVersion)
+        sudo update-alternatives --set phpdbg /usr/bin/phpdbg$(phpVersion)
+        sudo update-alternatives --set php-cgi /usr/bin/php-cgi$(phpVersion)
+        sudo update-alternatives --set phar.phar /usr/bin/phar.phar$(phpVersion)
+        php -version
+      displayName: 'Use PHP version $(phpVersion)'
+    - script: composer install --no-interaction --prefer-dist
+      displayName: 'composer install'
+    # RUN UNIT TESTS    
+    - script: |
+         php artisan test --testsuite=Unit
+      displayName: 'Run Unit Tests'
+    # PUSH THE IMAGE TO REGISTRY, KEEP TAG NUMBER GENERATED FOR LATER USE  
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        useDefaultContext: false
+        buildContext: .
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+# DEPLOY THE NEW IMAGE TO CLUSTER
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: 
+  - GatherInfo
+  - Build
+  condition: succeeded()
+  variables:
+    newSlot: $[ stageDependencies.GatherInfo.GatheringInfoJob.outputs['PassOutputColors.newSlot'] ]
+    oldSlot: $[ stageDependencies.GatherInfo.GatheringInfoJob.outputs['PassOutputColors.oldSlot'] ]
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: $(environment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # INSTALL KUBECTL ON THE AGENT
+          - task: KubectlInstaller@0
+            displayName: Installing kubectl
+            inputs:
+              kubectlVersion: 'latest'
+          # GET SECRET TO ALLOW IMAGE PULL FROM THE REGISTRY    
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+          # INSTALL HELM ON THE AGENT    
+          - task: HelmInstaller@0
+            inputs:
+              helmVersion: '2.14.1'
+              installKubectl: true
+          - bash: echo "Existing Service is $OLDSLOT | Deploying $NEWSLOT"
+            displayName: Show Service Slot Info   
+          # DEPLOY TO KUBERNETES CLUSTER SLOT BLUE OR GREEN (THE ONE ONE CURRENTLY USED)  
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: $(kubServiceEndpoint)
+              namespace: '$(namespace)'
+              manifests: "$(Pipeline.Workspace)/manifests/bluegreen/deployment-$(newSlot).yml"
+              # USE THE CODE BELOW FOR 'MANIFESTS' when you need to create the service as well
+              # Should only need to be done if the service does not exist.
+              # TODO maybe a good idea to automatically detect this?
+              # manifests: |
+              #    $(Pipeline.Workspace)/manifests/bluegreen/deployment-$(newSlot).yml
+              #    $(Pipeline.Workspace)/manifests/bluegreen/service-stage.yml
+              containers: $(containerRegistry)/$(imageRepository):$(tag)
+              imagePullSecrets: $(imagePullSecret)
+          - task: PublishBuildArtifacts@1
+# NOW RUN THE INTEGRATION TESTS
+- stage: IntegrationTest
+  displayName: 'Run Integration Tests'
+  dependsOn: 
+  - GatherInfo
+  - Build
+  - Deploy
+  condition: succeeded()
+  variables:
+    newSlot: $[ stageDependencies.GatherInfo.GatheringInfoJob.outputs['PassOutputColors.newSlot'] ]
+    oldSlot: $[ stageDependencies.GatherInfo.GatheringInfoJob.outputs['PassOutputColors.oldSlot'] ]
+  jobs:
+  - job: IntegrationTesting
+    displayName: "Performing Integration Test"
+    steps:   
+      # IDENTIFY THE NEW POD USING THE 'APP' AND 'SLOT' SELECTORS
+      - task: Kubernetes@1
+        displayName: Getting new pod info
+        name: newPodInformation
+        inputs:
+          connectionType: 'Kubernetes Service Connection'
+          kubernetesServiceEndpoint: $(kubServiceEndpoint)
+          namespace: $(namespace)
+          command: 'get'
+          arguments: "pods --selector app=$(deployment),slot=$(newSlot) -o name"
+          secretType: 'dockerRegistry'
+          containerRegistryType: 'Azure Container Registry'
+          outputFormat: none
+      # SET THE NEW POD NAME AS A VARIABLE THAT AZURE PIPELINES CAN USE
+      - bash: |
+          echo "kubectl result: $NEWPODINFORMATION_KUBECTLOUTPUT"
+          echo "##vso[task.setvariable variable=newPodName;]$NEWPODINFORMATION_KUBECTLOUTPUT"
+        displayName: Setting newPodName
+      # RUN THE INTEGRATION TEST USING ARTISAN COMMAND INSIDE THE NEW POD (KUBECTL COMMAND)  
+      - task: Kubernetes@1
+        displayName: Integration Test
+        inputs:
+          connectionType: 'Kubernetes Service Connection'
+          kubernetesServiceEndpoint: $(kubServiceEndpoint)
+          namespace: $(namespace)
+          command: 'exec'
+          arguments: '-it $(newPodName) -n $(namespace) -- bash -c "cd $(workingDirectory) && php artisan test --testsuite=Integration"'
+          secretType: 'dockerRegistry'
+          containerRegistryType: 'Azure Container Registry'
+# MAKE A STAGE TO TAKE ACTIONS IF THE NEW DEPLOYMENT PASSED INTEGRATION TESTS
+- stage: PromoteSlots
+  displayName: Promote Staging to Production
+  dependsOn: 
+  - GatherInfo
+  - Build
+  - Deploy
+  - IntegrationTest
+  condition: succeeded()
+  variables:
+    newSlot: $[ stageDependencies.GatherInfo.GatheringInfoJob.outputs['PassOutputColors.newSlot'] ]
+    oldSlot: $[ stageDependencies.GatherInfo.GatheringInfoJob.outputs['PassOutputColors.oldSlot'] ]
+  jobs:
+  - job: PromotingServiceSlots
+    displayName: "Promoting Service Slots from Staging to Production"
+    steps:
+    - bash: echo "Switching Production from  $OLDSLOT to $NEWSLOT | Staging from $NEWSLOT to $OLDSLOT"
+      displayName: Show Service Slot Info
+    # RUN SCRIPT TO PATCH EXISTING PROD SERVICE TO DIRECT TRAFFIC TO NEW SLOT
+    - task: Kubernetes@1
+      displayName: Switching Production selector to new slot [$(newSlot)]
+      name: SwitchServiceSlotsProduction
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: $(kubServiceEndpoint)
+        namespace: $(namespace)
+        command: 'patch'
+        arguments: "service $(service) --patch-file $(Pipeline.Workspace)/s/manifests/bluegreen/promote-$(newSlot)-patch.yml"
+    # RUN SCRIPT TO PATCH EXISTING STAGING SERVICE TO DIRECT TRAFFIC TO OLD SLOT
+    - task: Kubernetes@1
+      displayName: Switching Staging Selector to old slot [$(oldSlot)]
+      name: SwitchServiceSlotsStaging
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: $(kubServiceEndpoint)
+        namespace: $(namespace)
+        command: 'patch'
+        arguments: "service $(service-stage) --patch-file $(Pipeline.Workspace)/s/manifests/bluegreen/promote-$(oldSlot)-patch.yml"
+# MAKE A STAGE TO TAKE ACTIONS IF THE NEW DEPLOYMENT DID NOT PASS INTEGRATION TESTS
+# YOU WON'T NEED TO DO ANYTHING TO RESTORE THE APP TO A PREVIOUS WORKING STATE
+# BECAUSE THE PROD SERVICE WAS NEVER SWITCHED OVER.
+- stage: RejectSlots
+  displayName: Reject New Slot
+  dependsOn: IntegrationTest
+  condition: failed()
+  jobs:
+  - job: RemoveFailedImage
+    displayName: "Removing Failed Image"
+    steps:
+    #OPTIONAL: REMOVE THE FAILED IMAGE FROM THE CONTAINER REGISTRY
+    - task: AzureCLI@2
+      displayName: 'Removing Failed Image $(containerRegistry)/$(imageRepository):$(tag)'
+      inputs:
+        azureSubscription: Registry
+        scriptType: bash
+        scriptLocation: inlineScript
+        arguments: '$(containerRegistry) $(imageRepository):$(tag)'
+        inlineScript: 'az acr repository delete --name $1 --image $2 -y'

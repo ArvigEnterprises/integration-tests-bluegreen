@@ -1,0 +1,12 @@
+dependencies:
+- name: arvig-mysql
+  repository: file://../arvig-mysql
+  version: 0.1.0
+- name: arvig-mysql
+  repository: file://../arvig-mysql
+  version: 0.1.0
+- name: redis
+  repository: https://charts.bitnami.com/bitnami
+  version: 16.4.5
+digest: sha256:46f125e4d9e0c589fc94b1145d7bcf09670fca09d6364b0b856a678feb4d7004
+generated: "2022-03-04T14:16:20.613942464-06:00"

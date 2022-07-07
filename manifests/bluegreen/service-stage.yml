@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+    name: arvigtestcluster334d-stage
+spec:
+    type: LoadBalancer
+    ports:
+    - port: 80 
+    selector:
+        app: arvigtestcluster334d
+        slot: green

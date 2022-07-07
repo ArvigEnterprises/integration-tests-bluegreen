@@ -1,0 +1,32 @@
+{{- define "lara-lib.deployment" -}}
+apiVersion: apps/v1
+kind: Deployment  # Specify the type of manifest this is.  In this case a deployment, which is used to get and keep pods running.
+metadata:
+  labels:
+    app: {{ .Values.deployment.name }}
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Values.namespace }}  # Specify the name of the namespace to run this object under.
+spec:
+  replicas: {{ .Values.replicaCount }} # Specify how many copies of the pods we want running.
+  selector:
+    matchLabels:
+      app: {{ .Values.selectorLabels.app }}  # Pods matching this label are part of this deployment
+  strategy:  # Specify the rules for updating or replacing pods.
+    type:  {{ default "RollingUpdate" .Values.strategy.type }}
+    rollingUpdate:
+      maxSurge: {{ .Values.strategy.rollingUpdateMaxSurge }}
+      maxUnavailable: {{ .Values.strategy.rollingUpdateMaxUnavailable }}
+  template:  # Here is where we will define the pods that the deployment will use.
+    metadata:
+      labels:
+        app: {{ .Values.selectorLabels.app }}  # Set the label of the pod.  This is what the deployment selector up above is referencing. Services will also reference this.
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:  # Specify how the container(s) in this pod are created.
+        - name: {{ .Values.selectorLabels.app }}
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+{{- end -}}

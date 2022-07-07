@@ -1,0 +1,26 @@
+{{- define "lara-lib.ingress" -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.ingress.name }}
+  namespace: {{ .Values.namespace }} # Specify the name of the namespace to run this object under.
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  tls:
+    - hosts:
+      - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecret }}
+  rules:
+    - host: {{ .Values.ingress.host }}  # Traffic arriving at the load balancer to this Domain Name will get routed according to this ingress spec.
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.service.name }} # Traffic will be sent to a service with this label.
+                port:
+                  number: {{ .Values.ingress.port }}  # Port on the service to route traffic to.
+
+{{- end -}}

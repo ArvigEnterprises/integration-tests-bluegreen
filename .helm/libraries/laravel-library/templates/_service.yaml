@@ -1,0 +1,20 @@
+{{- define "lara-lib.service" -}}
+apiVersion: v1
+kind: Service # Specify the type of manifest this is.  In this case a service, which is used to allow network access to pods.
+metadata:
+  labels:
+    app: {{ .Values.service.name }}
+  name: {{ .Values.service.name }}
+  namespace: {{ .Values.namespace }} # Specify the name of the namespace to run this object under.
+spec:
+  type: {{ .Values.service.type }} # Type of Service.  Options are ClusterIP or Node Port
+
+  selector:
+    app: {{ .Values.selectorLabels.app }} # Traffic to this service will be routed to pod(s) with this label.
+
+  ports:
+    - name: {{ .Values.service.portName }}
+      port: {{ .Values.service.port }} # Port the service will be listening on
+      protocol: {{ .Values.service.portProtocol }}
+      targetPort: {{ .Values.service.targetPort }} # Port that pod(s) will be listening on
+{{- end -}}

@@ -1,0 +1,214 @@
+# Deploy to Azure Kubernetes Service
+# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+# YOU WILL NEED TO REPLACE VARIABLES HERE RELATED TO THE ARVIG CLUSTER ON AZURE
+  # App
+  workingDirectory: '/var/www/laravel'
+  phpVersion: 8.1
+  # Pipeline
+  environment: 'Arvigtestintegration.arvig-test-clusterb506'
+  # kub
+  kubServiceEndpoint: 'arvig-test-cluster-arvig-test-clusterb506-admin'
+  deployment: arvigtestcluster334d
+  namespace: 'arvig-test-clusterb506'
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '60b1e7bb-9b8d-4857-ba64-cfad1968db5f'
+  imageRepository: 'arvigtestcluster334d'
+  containerRegistry: 'arvigtestregistry.azurecr.io'
+  dockerfilePath: '**/.docker/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'arvigtestregistrya4d4-auth'
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+stages:
+# BUILD THE NEW IMAGE WHEN TRIGGERED
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: |
+        sudo update-alternatives --set php /usr/bin/php$(phpVersion)
+        sudo update-alternatives --set phar /usr/bin/phar$(phpVersion)
+        sudo update-alternatives --set phpdbg /usr/bin/phpdbg$(phpVersion)
+        sudo update-alternatives --set php-cgi /usr/bin/php-cgi$(phpVersion)
+        sudo update-alternatives --set phar.phar /usr/bin/phar.phar$(phpVersion)
+        php -version
+      displayName: 'Use PHP version $(phpVersion)'
+    - script: composer install --no-interaction --prefer-dist
+      displayName: 'composer install'
+    # RUN UNIT TESTS  
+    - script: |
+         php artisan test --testsuite=Unit
+      displayName: 'Run Unit Tests'
+    # PUSH THE IMAGE TO REGISTRY, KEEP TAG NUMBER GENERATED FOR LATER USE 
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        useDefaultContext: false
+        buildContext: .
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+    # ARTIFACTS FOR LATER USE IN THE PIPELINE      
+    - upload: manifests
+      artifact: manifests
+    - upload: tests
+      artifact: tests
+    - upload: .helm
+      artifact: .helm
+# DEPLOY THE NEW IMAGE TO CLUSTER      
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: $(environment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # GET SECRET TO ALLOW IMAGE PULL FROM THE REGISTRY
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+          # INSTALL HELM ON THE AGENT
+          - task: HelmInstaller@0
+            inputs:
+              helmVersion: '2.14.1'
+              installKubectl: true
+          # DEPLOY TO CLUSTER USING DEPLOYMENT AND SERVICE FILES (BUILT-IN CANARY STRATEGY)
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              strategy: 'canary'
+              percentage: '50'
+              manifests: |
+                $(Pipeline.Workspace)/manifests/canary/deployment.yml
+                $(Pipeline.Workspace)/manifests/canary/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
+          - task: PublishBuildArtifacts@1
+# NOW RUN THE INTEGRATION TESTS
+- stage: IntegrationTest
+  displayName: 'Run Integration Tests'
+  dependsOn: Deploy
+  jobs:
+  - job: IntegrationTesting
+    displayName: "Performing Integration Test"
+    steps:
+      # MAKE SURE KUBECTL IS INSTALLED IN THE AGENT
+      - task: KubectlInstaller@0
+        displayName: Installing kubectl
+        inputs:
+          kubectlVersion: 'latest'    
+      # IDENTIFY THE CANARY POD USING THE 'APP' SELECTORS
+      - task: Kubernetes@1
+        displayName: Getting canary pod info
+        name: canaryPodInformation
+        inputs:
+          connectionType: 'Kubernetes Service Connection'
+          kubernetesServiceEndpoint: $(kubServiceEndpoint)
+          namespace: $(namespace)
+          command: 'get'
+          arguments: "pods --selector azure-pipelines/version=canary,app=$(deployment) -o name"
+          secretType: 'dockerRegistry'
+          containerRegistryType: 'Azure Container Registry'
+          outputFormat: none
+      - task: Bash@3
+        displayName: Displaying Canary Pod Name
+        inputs:
+          targetType: 'inline'
+          script: echo $CANARYPODINFORMATION_KUBECTLOUTPUT
+      # SET THE CANARY POD NAME AS A VARIABLE THAT AZURE PIPELINES CAN USE
+      - bash: echo "##vso[task.setvariable variable=canaryPodName;]$CANARYPODINFORMATION_KUBECTLOUTPUT"
+        displayName: Setting CanaryPodName
+      # RUN THE INTEGRATION TEST USING ARTISAN COMMAND INSIDE THE CANARY POD (KUBECTL COMMAND)
+      - task: Kubernetes@1
+        displayName: Integration Test
+        inputs:
+          connectionType: 'Kubernetes Service Connection'
+          kubernetesServiceEndpoint: $(kubServiceEndpoint)
+          namespace: $(namespace)
+          command: 'exec'
+          arguments: '-it $(canaryPodName) -n $(namespace) -- bash -c "cd $(workingDirectory) && php artisan test --testsuite=Integration"'
+          secretType: 'dockerRegistry'
+          containerRegistryType: 'Azure Container Registry'
+# MAKE A STAGE TO TAKE ACTIONS IF THE CANARY PASSED INTEGRATION TESTS
+- stage: PromoteCanary
+  displayName: Promote canary
+  dependsOn: IntegrationTest
+  condition: succeeded()
+  jobs:
+  - deployment: PromoteCanary
+    displayName: Promote Canary
+    pool: 
+      vmImage: $(vmImageName)
+    environment: $(environment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:            
+          - task: KubernetesManifest@0
+            displayName: promote canary
+            inputs:
+              action: 'promote'
+              strategy: 'canary'
+              manifests: '$(Pipeline.Workspace)/manifests/canary/*'
+              containers: '$(containerRegistry)/$(imageRepository):$(tag)'
+              imagePullSecrets: '$(imagePullSecret)'
+# MAKE A STAGE TO TAKE ACTIONS IF THE CANARY FAILED INTEGRATION TESTS
+- stage: RejectCanary
+  displayName: Reject Canary
+  dependsOn: IntegrationTest
+  condition: failed()
+  jobs:
+  - deployment: RejectCanary
+    displayName: Reject Canary
+    pool: 
+      vmImage: $(vmImageName)
+    environment: $(environment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:            
+          # REJECT THE CANARY
+          - task: KubernetesManifest@0
+            displayName: reject canary
+            inputs:
+              action: 'reject'
+              strategy: 'canary'
+              manifests: '$(Pipeline.Workspace)/manifests/canary/*'
+          #OPTIONAL: REMOVE THE FAILED IMAGE FROM THE CONTAINER REGISTRY
+          - task: AzureCLI@2
+            displayName: 'Removing Failed Image $(containerRegistry)/$(imageRepository):$(tag)'
+            inputs:
+              azureSubscription: Registry
+              scriptType: bash
+              scriptLocation: inlineScript
+              arguments: '$(containerRegistry) $(imageRepository):$(tag)'
+              inlineScript: 'az acr repository delete --name $1 --image $2 -y'
